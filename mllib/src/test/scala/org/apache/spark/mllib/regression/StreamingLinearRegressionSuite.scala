@@ -17,13 +17,17 @@
 
 package org.apache.spark.mllib.regression
 
+import org.scalacheck.Prop.True
+
 import scala.collection.mutable.ArrayBuffer
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.mllib.linalg.Vectors
 import org.apache.spark.mllib.util.LinearDataGenerator
-import org.apache.spark.streaming.{StreamingContext, TestSuiteBase}
+import org.apache.spark.streaming.{TestInputStream, StreamingContext, TestSuiteBase}
 import org.apache.spark.streaming.dstream.DStream
+
+import org.apache.spark.ml.regression.StreamingLinearRegression
 
 class StreamingLinearRegressionSuite extends SparkFunSuite with TestSuiteBase {
 
@@ -167,7 +171,8 @@ class StreamingLinearRegressionSuite extends SparkFunSuite with TestSuiteBase {
     // train and predict
     ssc = setupStreams(testInput, (inputDStream: DStream[LabeledPoint]) => {
       model.trainOn(inputDStream)
-      model.predictOnValues(inputDStream.map(x => (x.label, x.features)))
+      val temp = model.predictOnValues(inputDStream.map(x => (x.label, x.features)))
+      temp
     })
 
     val output: Seq[Seq[(Double, Double)]] = runStreams(ssc, numBatches, numBatches)
@@ -193,5 +198,36 @@ class StreamingLinearRegressionSuite extends SparkFunSuite with TestSuiteBase {
       }
     )
     val output: Seq[Seq[(Double, Double)]] = runStreams(ssc, numBatches, numBatches)
+  }
+
+  // Test training combined with prediction
+  test("ml streaming test") {
+    // create model initialized with zero weights
+    val model = new StreamingLinearRegression()
+
+    // generate sequence of simulated data for testing
+    val numBatches = 10
+    val nPoints = 100
+    val testInput = (0 until numBatches).map { i =>
+      LinearDataGenerator.generateLinearInput(0.0, Array(10.0, 10.0), nPoints, 42 * (i + 1))
+    }
+
+    // train and predict
+    ssc = setupStreams(testInput, (inputDStream: DStream[LabeledPoint]) => {
+      model.fit(inputDStream)
+      //inputDStream.print()
+      val predict_stream = model.transform(inputDStream)
+      predict_stream.print()
+      predict_stream.map(x => (x, x))
+    })
+
+    val output: Seq[Seq[(Double, Double)]] = runStreams(ssc, numBatches, numBatches)
+
+    println(s"*** output ${output.length} ${output(4).length} is ${output.map(x => x.mkString(" ")).mkString(" ")}")
+
+    // assert that prediction error improves, ensuring that the updated model is being used
+    //val error = output.map(batch => batch.map(p => math.abs(p._1 - p._2)).sum / nPoints).toList
+    //assert((error.head - error.last) > 2)
+
   }
 }
