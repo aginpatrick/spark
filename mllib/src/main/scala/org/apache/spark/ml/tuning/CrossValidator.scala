@@ -96,7 +96,8 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
   @Since("2.0.0")
   def setSeed(value: Long): this.type = set(seed, value)
 
-
+  /** @group setParam */
+  @Since("2.1.0")
   def setNumParallelEval(value: Int): this.type = set(numParallelEval, value)
 
   @Since("2.0.0")
@@ -166,7 +167,6 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
   }
 
   private def fitParallel(dataset: Dataset[_]): Array[Double] = {
-    // WIP
     val schema = dataset.schema
     transformSchema(schema, logging = true)
     val sparkSession = dataset.sparkSession
