@@ -19,8 +19,6 @@ package org.apache.spark.ml.tuning
 
 import java.util.{List => JList}
 
-import org.apache.spark.rdd.RDD
-
 import scala.collection.JavaConverters._
 
 import com.github.fommil.netlib.F2jBLAS
@@ -168,6 +166,7 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
   }
 
   private def fitParallel(dataset: Dataset[_]): Array[Double] = {
+    // WIP
     val schema = dataset.schema
     transformSchema(schema, logging = true)
     val sparkSession = dataset.sparkSession
