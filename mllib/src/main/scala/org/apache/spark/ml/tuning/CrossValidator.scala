@@ -19,6 +19,8 @@ package org.apache.spark.ml.tuning
 
 import java.util.{List => JList}
 
+import org.apache.spark.rdd.RDD
+
 import scala.collection.JavaConverters._
 
 import com.github.fommil.netlib.F2jBLAS
@@ -52,6 +54,11 @@ private[ml] trait CrossValidatorParams extends ValidatorParams {
   def getNumFolds: Int = $(numFolds)
 
   setDefault(numFolds -> 3)
+
+  val numParallelEval: IntParam = new IntParam(this, "numParallelEval",
+    "max number of models to evaluate in parallel, 1 for serial evaluation")
+
+  setDefault(numParallelEval -> Int.MaxValue)
 }
 
 /**
@@ -91,8 +98,41 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
   @Since("2.0.0")
   def setSeed(value: Long): this.type = set(seed, value)
 
+
+  def setNumParallelEval(value: Int): this.type = set(numParallelEval, value)
+
   @Since("2.0.0")
   override def fit(dataset: Dataset[_]): CrossValidatorModel = {
+    val est = $(estimator)
+    val eval = $(evaluator)
+    val epm = $(estimatorParamMaps)
+    val isPipeline = est.isInstanceOf[Pipeline]
+
+    val instr = Instrumentation.create(this, dataset)
+    instr.logParams(numFolds, seed)
+    logTuningParams(instr)
+
+    val metrics = ($(numParallelEval), isPipeline) match {
+      case (n, _) if n <= 1 =>
+        fitSerial(dataset)
+      case (_, false) =>
+        fitParallel(dataset)
+      case (_, true) =>
+        fitParallelPipeline(dataset, est.asInstanceOf[Pipeline])
+    }
+
+    logInfo(s"Average cross-validation metrics: ${metrics.toSeq}")
+    val (bestMetric, bestIndex) =
+      if (eval.isLargerBetter) metrics.zipWithIndex.maxBy(_._1)
+      else metrics.zipWithIndex.minBy(_._1)
+    logInfo(s"Best set of parameters:\n${epm(bestIndex)}")
+    logInfo(s"Best cross-validation metric: $bestMetric.")
+    val bestModel = est.fit(dataset, epm(bestIndex)).asInstanceOf[Model[_]]
+    instr.logSuccess(bestModel)
+    copyValues(new CrossValidatorModel(uid, bestModel, metrics).setParent(this))
+  }
+
+  private def fitSerial(dataset: Dataset[_]): Array[Double] = {
     val schema = dataset.schema
     transformSchema(schema, logging = true)
     val sparkSession = dataset.sparkSession
@@ -102,12 +142,9 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
     val numModels = epm.length
     val metrics = new Array[Double](epm.length)
 
-    val instr = Instrumentation.create(this, dataset)
-    instr.logParams(numFolds, seed)
-    logTuningParams(instr)
-
     val splits = MLUtils.kFold(dataset.toDF.rdd, $(numFolds), $(seed))
-    splits.zipWithIndex.foreach { case ((training, validation), splitIndex) =>
+    logDebug("Running serial cross-validation.")
+    splits.zipWithIndex.map { case ((training, validation), splitIndex) =>
       val trainingDataset = sparkSession.createDataFrame(training, schema).cache()
       val validationDataset = sparkSession.createDataFrame(validation, schema).cache()
       // multi-model training
@@ -122,18 +159,100 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
         metrics(i) += metric
         i += 1
       }
+
       validationDataset.unpersist()
     }
+
     f2jBLAS.dscal(numModels, 1.0 / $(numFolds), metrics, 1)
-    logInfo(s"Average cross-validation metrics: ${metrics.toSeq}")
-    val (bestMetric, bestIndex) =
-      if (eval.isLargerBetter) metrics.zipWithIndex.maxBy(_._1)
-      else metrics.zipWithIndex.minBy(_._1)
-    logInfo(s"Best set of parameters:\n${epm(bestIndex)}")
-    logInfo(s"Best cross-validation metric: $bestMetric.")
-    val bestModel = est.fit(dataset, epm(bestIndex)).asInstanceOf[Model[_]]
-    instr.logSuccess(bestModel)
-    copyValues(new CrossValidatorModel(uid, bestModel, metrics).setParent(this))
+    metrics
+  }
+
+  private def fitParallel(dataset: Dataset[_]): Array[Double] = {
+    val schema = dataset.schema
+    transformSchema(schema, logging = true)
+    val sparkSession = dataset.sparkSession
+    val est = $(estimator)
+    val eval = $(evaluator)
+    val epm = $(estimatorParamMaps)
+    val numModels = epm.length
+    val numPar = $(numParallelEval)
+    val splits = MLUtils.kFold(dataset.toDF.rdd, $(numFolds), $(seed))
+    logDebug("Running parallelized cross-validation.")
+
+    // Compute metrics for each model over each fold
+    val metrics = splits.zipWithIndex.map { case ((training, validation), splitIndex) =>
+      val trainingDataset = sparkSession.createDataFrame(training, schema).cache()
+      val validationDataset = sparkSession.createDataFrame(validation, schema).cache()
+      // multi-model training
+      logDebug(s"Train split $splitIndex with multiple sets of parameters.")
+
+      // Fit models concurrently, limited by using a sliding window over models
+      val models = epm.sliding(numPar, numPar).map { slide =>
+        slide.par.map(est.fit(dataset, _))
+      }.toList.flatten.asInstanceOf[Seq[Model[_]]]
+      trainingDataset.unpersist()
+
+      // Evaluated models concurrently, limited by using a sliding window over models
+      val foldMetrics = models.zip(epm).sliding(numPar, numPar).map { slide =>
+        slide.par.map { m =>
+          // TODO: duplicate evaluator to take extra params from input
+          val metric = eval.evaluate(m._1.transform(validationDataset, m._2))
+          logDebug(s"Got metric $metric for model trained with ${m._2}.")
+          metric
+        }
+      }.toList.flatten
+
+      validationDataset.unpersist()
+      foldMetrics
+    }.reduce((mA, mB) => mA.zip(mB).map(m => m._1 + m._2)).toArray
+
+    // Calculate average metric for all folds
+    f2jBLAS.dscal(numModels, 1.0 / $(numFolds), metrics, 1)
+    metrics
+  }
+
+  private def fitParallelPipeline(dataset: Dataset[_], est: Pipeline): Array[Double] = {
+    val schema = dataset.schema
+    transformSchema(schema, logging = true)
+    val sparkSession = dataset.sparkSession
+    val eval = $(evaluator)
+    val epm = $(estimatorParamMaps)
+    val numModels = epm.length
+    val numPar = $(numParallelEval)
+    val splits = MLUtils.kFold(dataset.toDF.rdd, $(numFolds), $(seed))
+    logDebug("Running parallelized cross-validation for a Pipeline model.")
+
+    // Compute metrics for each model over each fold
+    val metrics = splits.zipWithIndex.map { case ((training, validation), splitIndex) =>
+      val trainingDataset = sparkSession.createDataFrame(training, schema).cache()
+      val validationDataset = sparkSession.createDataFrame(validation, schema).cache()
+      // multi-model training
+      logDebug(s"Train split $splitIndex with multiple sets of parameters.")
+      //val models = est.fit(trainingDataset, epm).asInstanceOf[Seq[Model[_]]]
+
+      // Fit models concurrently, limited by using a sliding window over models
+      val models = epm.sliding(numPar, numPar).map { slide =>
+        slide.par.map(est.fit(dataset, _))
+      }.toList.flatten.asInstanceOf[Seq[Model[_]]]
+      trainingDataset.unpersist()
+
+      // Evaluated models concurrently, limited by using a sliding window over models
+      val foldMetrics = models.zip(epm).sliding(numPar, numPar).map { slide =>
+        slide.par.map { m =>
+          // TODO: duplicate evaluator to take extra params from input
+          val metric = eval.evaluate(m._1.transform(validationDataset, m._2))
+          logDebug(s"Got metric $metric for model trained with ${m._2}.")
+          metric
+        }
+      }.toList.flatten
+
+      validationDataset.unpersist()
+      foldMetrics
+    }.reduce((mA, mB) => mA.zip(mB).map(m => m._1 + m._2)).toArray
+
+    // Calculate average metric for all folds
+    f2jBLAS.dscal(numModels, 1.0 / $(numFolds), metrics, 1)
+    metrics
   }
 
   @Since("1.4.0")
