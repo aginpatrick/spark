@@ -20,6 +20,7 @@ package org.apache.spark.ml.tuning
 import java.util.{List => JList}
 
 import scala.collection.JavaConverters._
+import scala.collection.mutable.ListBuffer
 
 import com.github.fommil.netlib.F2jBLAS
 import org.apache.hadoop.fs.Path
@@ -117,7 +118,7 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
       case (_, false) =>
         fitParallel(dataset)
       case (_, true) =>
-        fitParallelPipeline(dataset, est.asInstanceOf[Pipeline])
+        fitPipelineParallel(dataset, est.asInstanceOf[Pipeline])
     }
 
     logInfo(s"Average cross-validation metrics: ${metrics.toSeq}")
@@ -186,13 +187,13 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
       logDebug(s"Train split $splitIndex with multiple sets of parameters.")
 
       // Fit models concurrently, limited by using a sliding window over models
-      val models = epm.sliding(numPar, numPar).map { slide =>
+      val models = epm.grouped(numPar).map { slide =>
         slide.par.map(est.fit(dataset, _))
       }.toList.flatten.asInstanceOf[Seq[Model[_]]]
       trainingDataset.unpersist()
 
       // Evaluated models concurrently, limited by using a sliding window over models
-      val foldMetrics = models.zip(epm).sliding(numPar, numPar).map { slide =>
+      val foldMetrics = models.zip(epm).grouped(numPar).map { slide =>
         slide.par.map { m =>
           // TODO: duplicate evaluator to take extra params from input
           val metric = eval.evaluate(m._1.transform(validationDataset, m._2))
@@ -210,7 +211,7 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
     metrics
   }
 
-  private def fitParallelPipeline(dataset: Dataset[_], est: Pipeline): Array[Double] = {
+  private def fitPipelineParallel(dataset: Dataset[_], est: Pipeline): Array[Double] = {
     val schema = dataset.schema
     transformSchema(schema, logging = true)
     val sparkSession = dataset.sparkSession
@@ -221,33 +222,106 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
     val splits = MLUtils.kFold(dataset.toDF.rdd, $(numFolds), $(seed))
     logDebug("Running parallelized cross-validation for a Pipeline model.")
 
-    // Compute metrics for each model over each fold
+    // Used to collect all ParamMaps belonging to a Pipeline Stage
+    case class StageParams(stage: PipelineStage, spm: Array[ParamMap])
+
+    // Implements transformation to go from one Node to another
+    class Edge(_fit: () => Transformer, _transform: (Transformer) => DataFrame) {
+      private var transformer: Transformer = null
+      def fit(): Unit = {
+        if (transformer == null) {
+          transformer = _fit()
+        }
+      }
+      def transform(): DataFrame = {
+        _transform(transformer)
+      }
+    }
+
+    // Stores a dataset that can be reused by child Nodes
+    class Node(edge: Edge, _clearParent: () => Unit) {
+      private var dataset: DataFrame = null
+      def fit(): Unit = {
+        edge.fit()
+      }
+      def fitTransform(): DataFrame = {
+        if (dataset == null) {
+          edge.fit()
+          dataset = edge.transform()
+        }
+        dataset
+      }
+      def clearDataset(): Unit = {
+        dataset = null
+        _clearParent()  // TODO - may not need to clear parent
+      }
+    }
+
+    val theStages = est.getStages
+
+    // Search for the last estimator.
+    var indexOfLastEstimator = -1
+    theStages.view.zipWithIndex.foreach { case (stage, index) =>
+      stage match {
+        case _: Estimator[_] =>
+          indexOfLastEstimator = index
+        case _ =>
+      }
+    }
+
+    // Separate model params to corresponding stages
+    val stageParams = theStages.take(indexOfLastEstimator + 1).map { stage =>
+      val spm = epm.map { param =>
+        param.filter(stage).toList
+      }.distinct.map { paramList =>
+        new ParamMap().put(paramList)
+      }
+      StageParams(stage, spm)
+    }
+
     val metrics = splits.zipWithIndex.map { case ((training, validation), splitIndex) =>
       val trainingDataset = sparkSession.createDataFrame(training, schema).cache()
       val validationDataset = sparkSession.createDataFrame(validation, schema).cache()
-      // multi-model training
-      logDebug(s"Train split $splitIndex with multiple sets of parameters.")
-      //val models = est.fit(trainingDataset, epm).asInstanceOf[Seq[Model[_]]]
 
-      // Fit models concurrently, limited by using a sliding window over models
-      val models = epm.sliding(numPar, numPar).map { slide =>
-        slide.par.map(est.fit(dataset, _))
-      }.toList.flatten.asInstanceOf[Seq[Model[_]]]
-      trainingDataset.unpersist()
+      // Build tree - Node is dataset, Edge is transformer with applied params,
+      // leaves are pipeline models cut off at last estimator which are used to evaluate model
+      var rootDataset = () => trainingDataset
+      val root = new Node(new Edge(() => null, (_) => rootDataset()), () => Unit)
+      var leaves = Array[Node](root)
 
-      // Evaluated models concurrently, limited by using a sliding window over models
-      val foldMetrics = models.zip(epm).sliding(numPar, numPar).map { slide =>
-        slide.par.map { m =>
-          // TODO: duplicate evaluator to take extra params from input
-          val metric = eval.evaluate(m._1.transform(validationDataset, m._2))
-          logDebug(s"Got metric $metric for model trained with ${m._2}.")
-          metric
+      for (i <- 0 to indexOfLastEstimator) {
+        val tempNodes = new ListBuffer[Node]()
+        leaves.foreach { prev =>
+          val spm = stageParams(i).spm
+          spm.foreach { params =>
+            val stage = theStages(i)
+            val parentEdge = stage match {
+              case estimator: Estimator[_] =>
+                new Edge(() => estimator.fit(prev.fitTransform(), params), (t: Transformer) => t.transform(prev.fitTransform(), params))
+              case transformer: Transformer =>
+                new Edge(() => transformer, (t: Transformer) => t.transform(prev.fitTransform(), params))
+            }
+            tempNodes += new Node(parentEdge, () => prev.clearDataset())
+          }
         }
-      }.toList.flatten
+        leaves = tempNodes.toArray
+      }
 
-      validationDataset.unpersist()
+      // fit but don't transform leaves - they are last estimators
+      leaves.foreach(_.fit())
+
+      // change tree dataset to now use validation dataset
+      leaves.foreach(_.clearDataset())
+      rootDataset = () => validationDataset
+
+      // evaluate each model
+      val foldMetrics = leaves.map { leaf =>
+        eval.evaluate(leaf.fitTransform())
+      }
       foldMetrics
-    }.reduce((mA, mB) => mA.zip(mB).map(m => m._1 + m._2)).toArray
+    }.reduce((mA, mB) => mA.zip(mB).map(m => m._1 + m._2))
+
+    //TODO - leaves don't match up with model index
 
     // Calculate average metric for all folds
     f2jBLAS.dscal(numModels, 1.0 / $(numFolds), metrics, 1)
