@@ -57,7 +57,10 @@ private[ml] trait CrossValidatorParams extends ValidatorParams {
   val numParallelEval: IntParam = new IntParam(this, "numParallelEval",
     "max number of models to evaluate in parallel, 1 for serial evaluation")
 
-  setDefault(numParallelEval -> Int.MaxValue)
+  val optimizePipeline: BooleanParam = new BooleanParam(this, "optimizePipeline",
+    "optimize evaluation of a pipeline with Param grid")
+
+  setDefault(numParallelEval -> Int.MaxValue, optimizePipeline -> true)
 }
 
 /**
@@ -101,18 +104,22 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
   @Since("2.1.0")
   def setNumParallelEval(value: Int): this.type = set(numParallelEval, value)
 
+  /** @group setParam */
+  @Since("2.1.0")
+  def setOptimizePipeline(value: Boolean): this.type = set(optimizePipeline, value)
+
   @Since("2.0.0")
   override def fit(dataset: Dataset[_]): CrossValidatorModel = {
     val est = $(estimator)
     val eval = $(evaluator)
     val epm = $(estimatorParamMaps)
-    val isPipeline = est.isInstanceOf[Pipeline]
-
+    val isPipelineAndOptimize = est.isInstanceOf[Pipeline] && $(optimizePipeline)
+    
     val instr = Instrumentation.create(this, dataset)
     instr.logParams(numFolds, seed)
     logTuningParams(instr)
 
-    val metrics = ($(numParallelEval), isPipeline) match {
+    val metrics = ($(numParallelEval), isPipelineAndOptimize) match {
       case (n, _) if n <= 1 =>
         fitSerial(dataset)
       case (_, false) =>
