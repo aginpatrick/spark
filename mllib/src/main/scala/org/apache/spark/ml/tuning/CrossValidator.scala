@@ -195,7 +195,7 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
 
       // Fit models concurrently, limited by using a sliding window over models
       val models = epm.grouped(numPar).map { slide =>
-        slide.par.map(est.fit(dataset, _))
+        slide.par.map(est.fit(trainingDataset, _))
       }.toList.flatten.asInstanceOf[Seq[Model[_]]]
       trainingDataset.unpersist()
 
