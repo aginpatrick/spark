@@ -227,7 +227,7 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
     val numModels = epm.length
     val numPar = $(numParallelEval)
     val splits = MLUtils.kFold(dataset.toDF.rdd, $(numFolds), $(seed))
-    logDebug("Running parallelized cross-validation for a Pipeline model.")
+    logDebug("Running optimized cross-validation for a Pipeline model.")
 
     // Used to collect all ParamMaps belonging to a Pipeline Stage
     case class StageParams(stage: PipelineStage, spm: Array[ParamMap])
@@ -298,17 +298,17 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
 
       for (i <- 0 to indexOfLastEstimator) {
         val tempNodes = new ListBuffer[Node]()
-        leaves.foreach { prev =>
+        leaves.foreach { parent =>
           val spm = stageParams(i).spm
           spm.foreach { params =>
             val stage = theStages(i)
             val parentEdge = stage match {
               case estimator: Estimator[_] =>
-                new Edge(() => estimator.fit(prev.fitTransform(), params), (t: Transformer) => t.transform(prev.fitTransform(), params))
+                new Edge(() => estimator.fit(parent.fitTransform(), params), (t: Transformer) => t.transform(parent.fitTransform(), params))
               case transformer: Transformer =>
-                new Edge(() => transformer, (t: Transformer) => t.transform(prev.fitTransform(), params))
+                new Edge(() => transformer, (t: Transformer) => t.transform(parent.fitTransform(), params))
             }
-            tempNodes += new Node(parentEdge, () => prev.clearDataset())
+            tempNodes += new Node(parentEdge, () => parent.clearDataset())
           }
         }
         leaves = tempNodes.toArray
