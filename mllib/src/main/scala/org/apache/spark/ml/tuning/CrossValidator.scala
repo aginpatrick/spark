@@ -194,14 +194,14 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
       logDebug(s"Train split $splitIndex with multiple sets of parameters.")
 
       // Fit models concurrently, limited by using a sliding window over models
-      val models = epm.grouped(numPar).map { slide =>
-        slide.par.map(est.fit(trainingDataset, _))
+      val models = epm.grouped(numPar).map { win =>
+        win.par.map(est.fit(trainingDataset, _))
       }.toList.flatten.asInstanceOf[Seq[Model[_]]]
       trainingDataset.unpersist()
 
       // Evaluated models concurrently, limited by using a sliding window over models
-      val foldMetrics = models.zip(epm).grouped(numPar).map { slide =>
-        slide.par.map { m =>
+      val foldMetrics = models.zip(epm).grouped(numPar).map { win =>
+        win.par.map { m =>
           // TODO: duplicate evaluator to take extra params from input
           val metric = eval.evaluate(m._1.transform(validationDataset, m._2))
           logDebug(s"Got metric $metric for model trained with ${m._2}.")
