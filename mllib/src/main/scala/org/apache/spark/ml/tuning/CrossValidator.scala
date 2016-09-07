@@ -233,7 +233,7 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
     case class StageParams(stage: PipelineStage, spm: Array[ParamMap])
 
     // Implements transformation to go from one Node to another
-    class Edge(_fit: () => Transformer, _transform: (Transformer) => DataFrame) {
+    class Edge(_fit: () => Transformer, _transform: (Transformer) => DataFrame, parent: Node) {
       private var transformer: Transformer = null
       def fit(): Unit = {
         if (transformer == null) {
@@ -243,10 +243,14 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
       def transform(): DataFrame = {
         _transform(transformer)
       }
+      def clear(clearOnlyData: Boolean): Unit = {
+        if (!clearOnlyData) transformer = null
+        if (parent != null) parent.clear(clearOnlyData)
+      }
     }
 
     // Stores a dataset that can be reused by child Nodes
-    class Node(edge: Edge, _clearParent: () => Unit) {
+    class Node(edge: Edge, val params: ParamMap) {
       private var dataset: DataFrame = null
       def fit(): Unit = {
         edge.fit()
@@ -258,9 +262,9 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
         }
         dataset
       }
-      def clearDataset(): Unit = {
+      def clear(clearOnlyData: Boolean = false): Unit = {
         dataset = null
-        _clearParent()  // TODO - may not need to clear parent
+        edge.clear(clearOnlyData)  // TODO - may not need to clear parent data
       }
     }
 
@@ -286,53 +290,67 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
       StageParams(stage, spm)
     }
 
+    // Build tree - Node is dataset, Edge is transformer with applied params,
+    // leaves are pipeline models cut off at last estimator which are used to evaluate model
+    var rootDataset: () => DataFrame = () => null
+    val root = new Node(new Edge(() => null, (_) => rootDataset(), null), ParamMap.empty)
+    var leaves = Array[Node](root)
+
+    for (i <- 0 to indexOfLastEstimator) {
+      val tempNodes = new ListBuffer[Node]()
+      leaves.foreach { parent =>
+        val spm = stageParams(i).spm
+        spm.foreach { params =>
+          val stage = theStages(i)
+          val parentEdge = stage match {
+            case estimator: Estimator[_] =>
+              new Edge(() => estimator.fit(parent.fitTransform(), params), (t: Transformer) => t.transform(parent.fitTransform(), params), parent)
+            case transformer: Transformer =>
+              new Edge(() => transformer, (t: Transformer) => t.transform(parent.fitTransform(), params), parent)
+          }
+          tempNodes += new Node(parentEdge, params ++ parent.params)
+        }
+      }
+      leaves = tempNodes.toArray
+    }
+
+    // Compute metrics for each fold
     val metrics = splits.zipWithIndex.map { case ((training, validation), splitIndex) =>
       val trainingDataset = sparkSession.createDataFrame(training, schema).cache()
       val validationDataset = sparkSession.createDataFrame(validation, schema).cache()
 
-      // Build tree - Node is dataset, Edge is transformer with applied params,
-      // leaves are pipeline models cut off at last estimator which are used to evaluate model
-      var rootDataset = () => trainingDataset
-      val root = new Node(new Edge(() => null, (_) => rootDataset()), () => Unit)
-      var leaves = Array[Node](root)
-
-      for (i <- 0 to indexOfLastEstimator) {
-        val tempNodes = new ListBuffer[Node]()
-        leaves.foreach { parent =>
-          val spm = stageParams(i).spm
-          spm.foreach { params =>
-            val stage = theStages(i)
-            val parentEdge = stage match {
-              case estimator: Estimator[_] =>
-                new Edge(() => estimator.fit(parent.fitTransform(), params), (t: Transformer) => t.transform(parent.fitTransform(), params))
-              case transformer: Transformer =>
-                new Edge(() => transformer, (t: Transformer) => t.transform(parent.fitTransform(), params))
-            }
-            tempNodes += new Node(parentEdge, () => parent.clearDataset())
-          }
-        }
-        leaves = tempNodes.toArray
-      }
+      // set tree root to the training dataset
+      rootDataset = () => trainingDataset
 
       // fit but don't transform leaves - they are last estimators
       leaves.foreach(_.fit())
 
       // change tree dataset to now use validation dataset
-      leaves.foreach(_.clearDataset())
+      leaves.foreach(_.clear(clearOnlyData = true))
       rootDataset = () => validationDataset
 
       // evaluate each model
       val foldMetrics = leaves.map { leaf =>
         eval.evaluate(leaf.fitTransform())
       }
+
+      // clear fit and data in tree to process next fold
+      leaves.foreach(_.clear())
+
       foldMetrics
     }.reduce((mA, mB) => mA.zip(mB).map(m => m._1 + m._2))
 
-    //TODO - leaves don't match up with model index
-
     // Calculate average metric for all folds
     f2jBLAS.dscal(numModels, 1.0 / $(numFolds), metrics, 1)
-    metrics
+
+    // leaves don't match up with model index, so need to put back in original order
+    // first sort by ParamMap string (which is ordered by name) then zip with metrics
+    // TODO - can probably find a cleaner way to do this
+    val sortedMetrics = leaves.map(node => node.params.toString).zip(metrics).sortBy(_._1).map(_._2)
+    val orderedMetrics = epm.map(params => params.toString).zipWithIndex.sortBy(_._1).map(_._2)
+        .zip(sortedMetrics).sortBy(_._1).map(_._2)
+
+    orderedMetrics
   }
 
   @Since("1.4.0")
