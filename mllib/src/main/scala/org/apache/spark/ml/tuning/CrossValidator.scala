@@ -125,7 +125,7 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
       case (_, false) =>
         fitParallel(dataset)
       case (_, true) =>
-        fitPipelineParallel(dataset, est.asInstanceOf[Pipeline])
+        fitPipelineOptimized(dataset, est.asInstanceOf[Pipeline])
     }
 
     logInfo(s"Average cross-validation metrics: ${metrics.toSeq}")
@@ -218,7 +218,7 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
     metrics
   }
 
-  private def fitPipelineParallel(dataset: Dataset[_], est: Pipeline): Array[Double] = {
+  private def fitPipelineOptimized(dataset: Dataset[_], est: Pipeline): Array[Double] = {
     val schema = dataset.schema
     transformSchema(schema, logging = true)
     val sparkSession = dataset.sparkSession
