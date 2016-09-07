@@ -327,6 +327,7 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
 
       // change tree dataset to now use validation dataset
       leaves.foreach(_.clear(clearOnlyData = true))
+      trainingDataset.unpersist()
       rootDataset = () => validationDataset
 
       // evaluate each model
@@ -336,6 +337,7 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
 
       // clear fit and data in tree to process next fold
       leaves.foreach(_.clear())
+      validationDataset.unpersist()
 
       foldMetrics
     }.reduce((mA, mB) => mA.zip(mB).map(m => m._1 + m._2))
