@@ -229,9 +229,6 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
     val splits = MLUtils.kFold(dataset.toDF.rdd, $(numFolds), $(seed))
     logDebug("Running optimized cross-validation for a Pipeline model.")
 
-    // Used to collect all ParamMaps belonging to a Pipeline Stage
-    case class StageParams(stage: PipelineStage, spm: Array[ParamMap])
-
     // Implements transformation to go from one Node to another
     class Edge(_fit: () => Transformer, _transform: (Transformer) => DataFrame, parent: Node) {
       private var transformer: Transformer = null
@@ -280,17 +277,17 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
       }
     }
 
-    // Separate model params to corresponding stages
+    // Separate model ParamMaps to corresponding stages
     val stageParams = theStages.take(indexOfLastEstimator + 1).map { stage =>
       val spm = epm.map { param =>
         param.filter(stage).toList
       }.distinct.map { paramList =>
         new ParamMap().put(paramList)
       }
-      StageParams(stage, spm)
+      spm
     }
 
-    // Build tree - Node is dataset, Edge is transformer with applied params,
+    // Build tree - Node is a dataset, Edge is a transformer with applied params,
     // leaves are pipeline models cut off at last estimator which are used to evaluate model
     var rootDataset: () => DataFrame = () => null
     val root = new Node(new Edge(() => null, (_) => rootDataset(), null), ParamMap.empty)
@@ -299,7 +296,7 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
     for (i <- 0 to indexOfLastEstimator) {
       val tempNodes = new ListBuffer[Node]()
       leaves.foreach { parent =>
-        val spm = stageParams(i).spm
+        val spm = stageParams(i)
         spm.foreach { params =>
           val stage = theStages(i)
           val parentEdge = stage match {
