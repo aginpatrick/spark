@@ -230,15 +230,19 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
     logDebug("Running optimized cross-validation for a Pipeline model.")
 
     // Implements transformation to go from one Node to another
-    class Edge(_fit: () => Transformer, _transform: (Transformer) => DataFrame, parent: Node) {
+    class Edge(stage: PipelineStage, params: ParamMap, parent: Node) {
       private var transformer: Transformer = null
       def fit(): Unit = {
-        if (transformer == null) {
-          transformer = _fit()
+        transformer = stage match {
+          case e: Estimator[_] =>
+            e.fit(parent.fit().transform(), params)
+          case t: Transformer =>
+            parent.fit()
+            t
         }
       }
       def transform(): DataFrame = {
-        _transform(transformer)
+        transformer.transform(parent.transform(), params)
       }
       def clear(clearOnlyData: Boolean): Unit = {
         if (!clearOnlyData) transformer = null
@@ -249,36 +253,29 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
     // Stores a dataset that can be reused by child Nodes
     class Node(edge: Edge, val params: ParamMap) {
       private var dataset: DataFrame = null
-      def fit(): Unit = {
-        edge.fit()
+      def setDataset(ds: DataFrame): Unit = {
+        dataset = ds
       }
-      def fitTransform(): DataFrame = {
+      def fit(): Node = {
+        if (edge != null) edge.fit()
+        this
+      }
+      def transform(): DataFrame = {
         if (dataset == null) {
-          edge.fit()
           dataset = edge.transform()
         }
         dataset
       }
       def clear(clearOnlyData: Boolean = false): Unit = {
         dataset = null
-        edge.clear(clearOnlyData)  // TODO - may not need to clear parent data
+        if (edge != null) edge.clear(clearOnlyData)  // TODO - may not need to clear parent data
       }
     }
 
     val theStages = est.getStages
 
-    // Search for the last estimator.
-    var indexOfLastEstimator = -1
-    theStages.view.zipWithIndex.foreach { case (stage, index) =>
-      stage match {
-        case _: Estimator[_] =>
-          indexOfLastEstimator = index
-        case _ =>
-      }
-    }
-
     // Separate model ParamMaps to corresponding stages
-    val stageParams = theStages.take(indexOfLastEstimator + 1).map { stage =>
+    val stageParams = theStages.map { stage =>
       val spm = epm.map { param =>
         param.filter(stage).toList
       }.distinct.map { paramList =>
@@ -288,23 +285,15 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
     }
 
     // Build tree - Node is a dataset, Edge is a transformer with applied params,
-    // leaves are pipeline models cut off at last estimator which are used to evaluate model
-    var rootDataset: () => DataFrame = () => null
-    val root = new Node(new Edge(() => null, (_) => rootDataset(), null), ParamMap.empty)
+    // the path from root to a leaf is a PiplineModel
+    val root = new Node(null, ParamMap.empty)
     var leaves = Array[Node](root)
 
-    for (i <- 0 to indexOfLastEstimator) {
+    theStages.zip(stageParams).foreach { case (stage, spm) =>
       val tempNodes = new ListBuffer[Node]()
       leaves.foreach { parent =>
-        val spm = stageParams(i)
         spm.foreach { params =>
-          val stage = theStages(i)
-          val parentEdge = stage match {
-            case estimator: Estimator[_] =>
-              new Edge(() => estimator.fit(parent.fitTransform(), params), (t: Transformer) => t.transform(parent.fitTransform(), params), parent)
-            case transformer: Transformer =>
-              new Edge(() => transformer, (t: Transformer) => t.transform(parent.fitTransform(), params), parent)
-          }
+          val parentEdge = new Edge(stage, params, parent)
           tempNodes += new Node(parentEdge, params ++ parent.params)
         }
       }
@@ -316,20 +305,23 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
       val trainingDataset = sparkSession.createDataFrame(training, schema).cache()
       val validationDataset = sparkSession.createDataFrame(validation, schema).cache()
 
-      // set tree root to the training dataset
-      rootDataset = () => trainingDataset
+      // will train multiple pipeline models
+      logDebug(s"Train split $splitIndex with multiple sets of parameters.")
 
-      // fit but don't transform leaves - they are last estimators
+      // set tree root to the training dataset
+      root.setDataset(trainingDataset)
+
+      // fit the PipelineModel
       leaves.foreach(_.fit())
 
       // change tree dataset to now use validation dataset
       leaves.foreach(_.clear(clearOnlyData = true))
       trainingDataset.unpersist()
-      rootDataset = () => validationDataset
+      root.setDataset(validationDataset)
 
       // evaluate each model
       val foldMetrics = leaves.map { leaf =>
-        eval.evaluate(leaf.fitTransform())
+        eval.evaluate(leaf.transform())
       }
 
       // clear fit and data in tree to process next fold
