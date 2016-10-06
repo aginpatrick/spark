@@ -134,6 +134,7 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
       else metrics.zipWithIndex.minBy(_._1)
     logInfo(s"Best set of parameters:\n${epm(bestIndex)}")
     logInfo(s"Best cross-validation metric: $bestMetric.")
+    logError(s"*** metric: ${metrics.mkString(",")}")
     val bestModel = est.fit(dataset, epm(bestIndex)).asInstanceOf[Model[_]]
     instr.logSuccess(bestModel)
     copyValues(new CrossValidatorModel(uid, bestModel, metrics).setParent(this))
@@ -233,12 +234,14 @@ class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
     class Edge(stage: PipelineStage, params: ParamMap, parent: Node) {
       private var transformer: Transformer = null
       def fit(): Unit = {
-        transformer = stage match {
-          case e: Estimator[_] =>
-            e.fit(parent.fit().transform(), params)
-          case t: Transformer =>
-            parent.fit()
-            t
+        if (transformer == null) {
+          transformer = stage match {
+            case e: Estimator[_] =>
+              e.fit(parent.fit().transform(), params)
+            case t: Transformer =>
+              parent.fit()
+              t
+          }
         }
       }
       def transform(): DataFrame = {
