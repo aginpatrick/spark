@@ -2526,8 +2526,8 @@ class Dataset[T] private[sql](
    * @since 2.2.0
    */
   @DeveloperApi
-  def collectAsArrow(): ArrowRecordBatch = {
-    val allocator = new RootAllocator(Long.MaxValue)
+  def collectAsArrow(
+      allocator: RootAllocator = new RootAllocator(Long.MaxValue)): ArrowRecordBatch = {
     withNewExecutionId {
       try {
         val collectedRows = queryExecution.executedPlan.executeCollect()
