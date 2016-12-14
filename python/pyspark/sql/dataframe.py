@@ -28,7 +28,7 @@ else:
 
 from pyspark import copy_func, since
 from pyspark.rdd import RDD, _load_from_socket, ignore_unicode_prefix
-from pyspark.serializers import BatchedSerializer, PickleSerializer, UTF8Deserializer
+from pyspark.serializers import ArrowSerializer, BatchedSerializer, PickleSerializer, UTF8Deserializer
 from pyspark.storagelevel import StorageLevel
 from pyspark.traceback_utils import SCCallSiteSync
 from pyspark.sql.types import _parse_datatype_json_string
@@ -36,6 +36,7 @@ from pyspark.sql.column import Column, _to_seq, _to_list, _to_java_column
 from pyspark.sql.readwriter import DataFrameWriter
 from pyspark.sql.streaming import DataStreamWriter
 from pyspark.sql.types import *
+
 
 __all__ = ["DataFrame", "DataFrameNaFunctions", "DataFrameStatFunctions"]
 
@@ -390,6 +391,15 @@ class DataFrame(object):
         with SCCallSiteSync(self._sc) as css:
             port = self._jdf.collectToPython()
         return list(_load_from_socket(port, BatchedSerializer(PickleSerializer())))
+
+    @ignore_unicode_prefix
+    @since(2.0)
+    def collectAsArrow(self):
+        """Returns all the records as an ArrowRecordBatch
+        """
+        with SCCallSiteSync(self._sc) as css:
+            port = self._jdf.collectAsArrowToPython()
+        return list(_load_from_socket(port, ArrowSerializer()))[0]
 
     @ignore_unicode_prefix
     @since(2.0)
@@ -1560,7 +1570,7 @@ class DataFrame(object):
         return DataFrame(jdf, self.sql_ctx)
 
     @since(1.3)
-    def toPandas(self):
+    def toPandas(self, useArrow=False):
         """Returns the contents of this :class:`DataFrame` as Pandas ``pandas.DataFrame``.
 
         This is only available if Pandas is installed and available.
@@ -1574,7 +1584,11 @@ class DataFrame(object):
         1    5    Bob
         """
         import pandas as pd
-        return pd.DataFrame.from_records(self.collect(), columns=self.columns)
+
+        if useArrow:
+            return self.collectAsArrow().to_pandas()
+        else:
+            return pd.DataFrame.from_records(self.collect(), columns=self.columns)
 
     ##########################################################################################
     # Pandas compatibility
