@@ -1573,6 +1573,9 @@ class DataFrame(object):
 
         This is only available if Pandas is installed and available.
 
+        :param useArrow: Make use of Apache Arrow for conversion, pyarrow must be installed
+            on the calling Python process.
+
         .. note:: This method should only be used if the resulting Pandas's DataFrame is expected
             to be small, as all the data is loaded into the driver's memory.
 
@@ -1581,11 +1584,10 @@ class DataFrame(object):
         0    2  Alice
         1    5    Bob
         """
-        import pandas as pd
-
         if useArrow:
             return self.collectAsArrow().to_pandas()
         else:
+            import pandas as pd
             return pd.DataFrame.from_records(self.collect(), columns=self.columns)
 
     ##########################################################################################
