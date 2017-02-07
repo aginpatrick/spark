@@ -2375,8 +2375,8 @@ class Dataset[T] private[sql](
     val cnvtr = converter.getOrElse(new ArrowConverters)
     withNewExecutionId {
       try {
-        val collectedRows = queryExecution.executedPlan.executeCollect()
-        cnvtr.internalRowsToPayload(collectedRows, this.schema)
+        val rowIter = queryExecution.executedPlan.executeToIterator()
+        cnvtr.interalRowIterToPayload(rowIter, this.schema)
       } catch {
         case e: Exception =>
           throw e
