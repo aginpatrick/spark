@@ -2373,14 +2373,18 @@ class Dataset[T] private[sql](
   @DeveloperApi
   def collectAsArrow(converter: Option[ArrowConverters] = None): ArrowPayload = {
     val cnvtr = converter.getOrElse(new ArrowConverters)
-    withNewExecutionId {
-      try {
-        val rowIter = queryExecution.executedPlan.executeToIterator()
-        cnvtr.interalRowIterToPayload(rowIter, this.schema)
-      } catch {
-        case e: Exception =>
-          throw e
-      }
+    val batchRdd = toArrowBatchBytes()
+    val batches = batchRdd.collect().flatMap(cnvtr.readBatchBytes)
+    new ArrowStaticPayload(batches: _*)
+  }
+
+  def toArrowBatchBytes(): RDD[Array[Byte]] = {
+    val schema_captured = this.schema
+    queryExecution.toRdd.mapPartitions { iter =>
+      val payload = new ArrowConverters().interalRowIterToPayload(iter, schema_captured)
+      val payloadBytes = ArrowConverters.payloadToByteArray(payload, schema_captured)
+      payload.foreach(_.close())
+      Iterator(payloadBytes)
     }
   }
 
@@ -2757,11 +2761,10 @@ class Dataset[T] private[sql](
    * Collect a Dataset as an ArrowRecordBatch, and serve the ArrowRecordBatch to PySpark.
    */
   private[sql] def collectAsArrowToPython(): Int = {
-    val payload = collectAsArrow()
-    val payloadBytes = ArrowConverters.payloadToByteArray(payload, this.schema)
-
+    val batchRdd = toArrowBatchBytes()
+    val batchByteArray = batchRdd.collect()
     withNewExecutionId {
-      PythonRDD.serveIterator(Iterator(payloadBytes), "serve-Arrow")
+      PythonRDD.serveIterator(batchByteArray.iterator, "serve-Arrow")
     }
   }
 

@@ -18,7 +18,8 @@
 package org.apache.spark.sql
 
 import java.io.ByteArrayOutputStream
-import java.nio.channels.Channels
+import java.nio.ByteBuffer
+import java.nio.channels.{SeekableByteChannel, Channels}
 
 import scala.collection.JavaConverters._
 
@@ -26,7 +27,7 @@ import io.netty.buffer.ArrowBuf
 import org.apache.arrow.memory.{BaseAllocator, RootAllocator}
 import org.apache.arrow.vector._
 import org.apache.arrow.vector.BaseValueVector.BaseMutator
-import org.apache.arrow.vector.file.ArrowWriter
+import org.apache.arrow.vector.file.{ArrowReader, ArrowWriter}
 import org.apache.arrow.vector.schema.{ArrowFieldNode, ArrowRecordBatch}
 import org.apache.arrow.vector.types.{FloatingPointPrecision, TimeUnit}
 import org.apache.arrow.vector.types.pojo.{ArrowType, Field, Schema}
@@ -34,10 +35,59 @@ import org.apache.arrow.vector.types.pojo.{ArrowType, Field, Schema}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.types._
 
+
+//////////////////////
+private[sql] class ByteArrayReadableSeekableByteChannel(var byteArray: Array[Byte]) extends SeekableByteChannel {
+  var _position: Long = 0L
+
+  override def isOpen: Boolean = {
+    byteArray != null
+  }
+
+  override def close(): Unit = {
+    byteArray = null
+  }
+
+  override def read(dst: ByteBuffer): Int = {
+    val remainingBuf = byteArray.length - _position
+    val length = Math.min(dst.remaining(), remainingBuf).toInt
+    dst.put(byteArray, _position.toInt, length)
+    _position += length
+    length.toInt
+  }
+
+  override def position(): Long = _position
+
+  override def position(newPosition: Long): SeekableByteChannel = {
+    _position = newPosition.toLong
+    this
+  }
+
+  override def size: Long = {
+    byteArray.length.toLong
+  }
+
+  override def write(src: ByteBuffer): Int = {
+    throw new UnsupportedOperationException("Read Only")
+  }
+
+  override def truncate(size: Long): SeekableByteChannel = {
+    throw new UnsupportedOperationException("Read Only")
+  }
+}
+//////////////////////
+
 /**
  * Intermediate data structure returned from Arrow conversions
  */
 private[sql] abstract class ArrowPayload extends Iterator[ArrowRecordBatch]
+
+private[sql] class ArrowStaticPayload(batches: ArrowRecordBatch*) extends ArrowPayload {
+  private val iter = batches.iterator
+
+  override def next(): ArrowRecordBatch = iter.next()
+  override def hasNext: Boolean = iter.hasNext
+}
 
 /**
  * Class that wraps an Arrow RootAllocator used in conversion
@@ -47,16 +97,17 @@ private[sql] class ArrowConverters {
 
   private[sql] def allocator: RootAllocator = _allocator
 
-  private class ArrowStaticPayload(batches: ArrowRecordBatch*) extends ArrowPayload {
-    private val iter = batches.iterator
-
-    override def next(): ArrowRecordBatch = iter.next()
-    override def hasNext: Boolean = iter.hasNext
-  }
-
   def interalRowIterToPayload(rowIter: Iterator[InternalRow], schema: StructType): ArrowPayload = {
     val batch = ArrowConverters.internalRowIterToArrowBatch(rowIter, schema, allocator, None)
     new ArrowStaticPayload(batch)
+  }
+
+  private[sql] def readBatchBytes(batchBytes: Array[Byte]): Array[ArrowRecordBatch] = {
+    val in = new ByteArrayReadableSeekableByteChannel(batchBytes)
+    val reader = new ArrowReader(in, _allocator)
+    val footer = reader.readFooter()
+    val batchBlocks = footer.getRecordBatches.asScala.toArray
+    batchBlocks.map(block => reader.readRecordBatch(block))
   }
 }
 
