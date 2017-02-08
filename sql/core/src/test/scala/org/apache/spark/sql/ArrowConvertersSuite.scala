@@ -124,8 +124,8 @@ class ArrowConvertersSuite extends SharedSQLContext {
 
   test("empty frame collect") {
     val arrowPayload = spark.emptyDataFrame.collectAsArrow()
-    assert(arrowPayload.nonEmpty)
-    arrowPayload.foreach(emptyBatch => assert(emptyBatch.getLength == 0))
+    assert(arrowPayload.isEmpty)
+    // TODO: test empty partitions
   }
 
   test("unsupported types") {
