@@ -170,17 +170,12 @@ class ArrowConvertersSuite extends SharedSQLContext {
     val jsonSchema = jsonReader.start()
     Validator.compareSchemas(arrowSchema, jsonSchema)
 
-    val arrowPayload = df.collectAsArrow(Some(converter))
+    // TODO: repartition because can only validate one batch
+    val arrowPayload = df.repartition(1).collectAsArrow(Some(converter))
     val arrowRoot = new VectorSchemaRoot(arrowSchema, converter.allocator)
     val vectorLoader = new VectorLoader(arrowRoot)
-    /*arrowPayload.foreach { pl =>
-      println("vector load")
-      vectorLoader.load(pl)
-    }*/
-    val arr = arrowPayload.toArray
-    vectorLoader.load(arr(0))
+    arrowPayload.foreach(vectorLoader.load)
     val jsonRoot = jsonReader.read()
-
     Validator.compareVectorSchemaRoot(arrowRoot, jsonRoot)
   }
 

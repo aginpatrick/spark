@@ -398,7 +398,7 @@ class DataFrame(object):
         """
         with SCCallSiteSync(self._sc) as css:
             port = self._jdf.collectAsArrowToPython()
-        return list(_load_from_socket(port, ArrowSerializer()))[0]
+        return list(_load_from_socket(port, ArrowSerializer()))
 
     @ignore_unicode_prefix
     @since(2.0)
@@ -1585,7 +1585,10 @@ class DataFrame(object):
         1    5    Bob
         """
         if useArrow:
-            return self.collectAsArrow().to_pandas()
+            from pyarrow.table import concat_tables
+            tables = self.collectAsArrow()
+            table = concat_tables(tables)
+            return table.to_pandas()
         else:
             import pandas as pd
             return pd.DataFrame.from_records(self.collect(), columns=self.columns)
