@@ -98,7 +98,7 @@ private[sql] class ArrowConverters {
   private[sql] def allocator: RootAllocator = _allocator
 
   def interalRowIterToPayload(rowIter: Iterator[InternalRow], schema: StructType): ArrowPayload = {
-    val batch = ArrowConverters.internalRowIterToArrowBatch(rowIter, schema, allocator, None)
+    val batch = ArrowConverters.internalRowIterToArrowBatch(rowIter, schema, allocator)
     new ArrowStaticPayload(batch)
   }
 
@@ -139,17 +139,20 @@ private[sql] object ArrowConverters {
   private def internalRowIterToArrowBatch(
       rowIter: Iterator[InternalRow],
       schema: StructType,
-      allocator: RootAllocator,
-      initialSize: Option[Int]): ArrowRecordBatch = {
+      allocator: RootAllocator): ArrowRecordBatch = {
 
     val columnWriters = schema.fields.zipWithIndex.map { case (field, ordinal) =>
       ColumnWriter(ordinal, allocator, field.dataType)
-        .init(initialSize)
+        .init()
     }
 
-    rowIter.foreach { row =>
-      columnWriters.foreach { writer =>
-        writer.write(row)
+    val writerLength = columnWriters.length
+    while (rowIter.hasNext) {
+      val row = rowIter.next()
+      var i = 0
+      while (i < writerLength) {
+        columnWriters(i).write(row)
+        i += 1
       }
     }
 
@@ -199,7 +202,7 @@ private[sql] object ArrowConverters {
 }
 
 private[sql] trait ColumnWriter {
-  def init(initialSize: Option[Int]): this.type
+  def init(): this.type
   def write(row: InternalRow): Unit
 
   /**
@@ -225,8 +228,7 @@ private[sql] abstract class PrimitiveColumnWriter(
   protected var count = 0
   protected var nullCount = 0
 
-  override def init(initialSize: Option[Int]): this.type = {
-    initialSize.foreach(valueVector.setInitialCapacity)
+  override def init(): this.type = {
     valueVector.allocateNew()
     this
   }
@@ -369,14 +371,13 @@ private[sql] class DateColumnWriter(ordinal: Int, allocator: BaseAllocator)
 
 private[sql] class TimeStampColumnWriter(ordinal: Int, allocator: BaseAllocator)
     extends PrimitiveColumnWriter(ordinal, allocator) {
-  override protected val valueVector: NullableTimeStampVector
-    = new NullableTimeStampVector("TimeStampValue", allocator)
-  override protected val valueMutator: NullableTimeStampVector#Mutator = valueVector.getMutator
+  override protected val valueVector: NullableTimeStampMicroVector
+    = new NullableTimeStampMicroVector("TimeStampValue", allocator)
+  override protected val valueMutator: NullableTimeStampMicroVector#Mutator = valueVector.getMutator
 
   override protected def setNull(): Unit = valueMutator.setNull(count)
 
   override protected def setValue(row: InternalRow, ordinal: Int): Unit = {
-    // TODO: use microsecond timestamp when ARROW-477 is resolved
     valueMutator.setSafe(count, row.getLong(ordinal) / 1000)
   }
 }

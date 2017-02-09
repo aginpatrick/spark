@@ -46,6 +46,7 @@ class ArrowConvertersSuite extends SharedSQLContext {
   test("collect to arrow record batch") {
     val arrowPayload = indexData.collectAsArrow()
     assert(arrowPayload.nonEmpty)
+    // TODO - make sure only one partition?
     arrowPayload.foreach(arrowRecordBatch => assert(arrowRecordBatch.getLength > 0))
     arrowPayload.foreach(arrowRecordBatch => assert(arrowRecordBatch.getNodes.size() > 0))
     arrowPayload.foreach(arrowRecordBatch => arrowRecordBatch.close())

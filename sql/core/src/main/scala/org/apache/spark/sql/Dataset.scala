@@ -2380,7 +2380,7 @@ class Dataset[T] private[sql](
 
   def toArrowBatchBytes(): RDD[Array[Byte]] = {
     val schema_captured = this.schema
-    queryExecution.toRdd.mapPartitions { iter =>
+    queryExecution.toRdd.mapPartitionsInternal { iter =>
       val payload = new ArrowConverters().interalRowIterToPayload(iter, schema_captured)
       val payloadBytes = ArrowConverters.payloadToByteArray(payload, schema_captured)
       payload.foreach(_.close())
